@@ -147,6 +147,84 @@ err:
     return (ret);
 }
 
+/*
+ * __rollback_row_add_update --
+ *     Add the provided update to the head of the update list.
+ */
+static inline int
+__rollback_col_add_update(WT_SESSION_IMPL *session, WT_PAGE *page, WT_COL *cip, WT_UPDATE *upd)
+{
+    WT_DECL_RET;
+    WT_PAGE_MODIFY *mod;
+    // WT_UPDATE *last_upd, *old_upd, **upd_entry;
+    WT_INSERT_HEAD *ins_head, **ins_headp;
+    size_t upd_size;
+
+    // last_upd = NULL;
+    /* If we don't yet have a modify structure, we'll need one. */
+    WT_RET(__wt_page_modify_init(session, page));
+    mod = page->modify;
+
+    /* Allocate an update array as necessary. */
+    // WT_PAGE_ALLOC_AND_SWAP(session, page, mod->mod_row_update, upd_entry, page->entries);
+    WT_PAGE_ALLOC_AND_SWAP(session, page, mod->mod_col_update, ins_headp, page->entries);
+
+    /* Set the WT_UPDATE array reference. */
+    ins_headp = &mod->mod_col_update[WT_COL_SLOT(page, cip)];
+    // upd_entry = &mod->mod_row_update[WT_ROW_SLOT(page, rip)];
+    upd_size = __wt_update_list_memsize(upd);
+
+
+    /* Allocate the WT_INSERT_HEAD structure as necessary. */
+    ins_head = *ins_headp;
+
+    /*
+    * Allocate a WT_INSERT/WT_UPDATE pair and transaction ID, and update the cursor to
+    * reference it (the WT_INSERT_HEAD might be allocated, the WT_INSERT was allocated).
+    */
+    WT_ERR(__col_insert_alloc(session, recno, skipdepth, &ins, &ins_size));
+    cbt->ins_head = ins_head;
+    cbt->ins = ins;
+
+
+
+
+    /* If there are existing updates, append them after the new updates. */
+    for (last_upd = upd; last_upd->next != NULL; last_upd = last_upd->next)
+        ;
+    last_upd->next = *upd_entry;
+
+    /*
+     * We can either put a tombstone plus an update or a single update on the update chain.
+     *
+     * Set the "old" entry to the second update in the list so that the serialization function
+     * succeeds in swapping the first update into place.
+     */
+    if (upd->next != NULL)
+        *upd_entry = upd->next;
+    old_upd = *upd_entry;
+
+    /*
+     * Point the new WT_UPDATE item to the next element in the list. The serialization function acts
+     * as our memory barrier to flush this write.
+     */
+    upd->next = old_upd;
+
+    /*
+     * Serialize the update. Rollback to stable doesn't need to check the visibility of the on page
+     * value to detect conflict.
+     */
+    WT_ERR(__wt_update_serial(session, NULL, page, upd_entry, &upd, upd_size, true));
+
+    if (0) {
+err:
+        if (last_upd != NULL)
+            last_upd->next = NULL;
+    }
+
+    return (ret);
+}
+
 static int
 __rollback_col_ondisk_fixup_key(WT_SESSION_IMPL *session, WT_PAGE *page, WT_COL *cip,
   wt_timestamp_t rollback_timestamp, bool replace, uint64_t recno)
@@ -161,12 +239,17 @@ __rollback_col_ondisk_fixup_key(WT_SESSION_IMPL *session, WT_PAGE *page, WT_COL 
     WT_DECL_RET;
     WT_CELL* kcell;
     WT_ITEM full_value;
+    WT_UPDATE *upd;
     // wt_timestamp_t hs_durable_ts, hs_start_ts, hs_stop_durable_ts, newer_hs_durable_ts;
     uint16_t *p;
+
+    printf("\n=== __rollback_col_ondisk_fixup_key ===\n");
 
     WT_CLEAR(full_value);
     WT_UNUSED(rollback_timestamp);
     WT_UNUSED(replace);
+
+    upd = NULL;
 
     /* Allocate buffers for the data store and history store key. */
     WT_RET(__wt_scr_alloc(session, 0, &key));
@@ -192,6 +275,12 @@ __rollback_col_ondisk_fixup_key(WT_SESSION_IMPL *session, WT_PAGE *page, WT_COL 
     // WT_ERR(__wt_vpack_uint(&p, 0,recno);
     // key->size = WT_PTRDIFF(p, key->data);
 
+    printf("Allocating tombstone to update...\n");
+    WT_ERR(__wt_upd_alloc_tombstone(session, &upd, NULL));
+    WT_STAT_CONN_DATA_INCR(session, txn_rts_keys_removed);
+    __wt_verbose(session, WT_VERB_RECOVERY_RTS(session), "%p: key removed", (void *)key);
+
+    WT_ERR(__rollback_col_add_update(session, page, cip, upd));
 
 
     if (0) {
@@ -516,7 +605,7 @@ __rollback_abort_col_ondisk_kv(
 
     __wt_cell_unpack_kv(session, page->dsk, kcell, &unpack);
 
-    printf("\n\n\n==============================\n");
+    printf("\n=== __rollback_abort_col_ondisk_kv ===\n");
     printf("start durable/commit timestamp: %s, %s, stop durable/commit "
         "timestamp: %s, %s and stable timestamp: %s",
         __wt_timestamp_to_string(unpack.tw.durable_start_ts, ts_string[0]),
@@ -524,7 +613,6 @@ __rollback_abort_col_ondisk_kv(
         __wt_timestamp_to_string(unpack.tw.durable_stop_ts, ts_string[2]),
         __wt_timestamp_to_string(unpack.tw.stop_ts, ts_string[3]),
         __wt_timestamp_to_string(rollback_timestamp, ts_string[4]));
-    printf("\n==============================\n\n\n");
 
     prepared = unpack.tw.prepare;
     if (WT_IS_HS(session->dhandle)) {
